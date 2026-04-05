@@ -2,19 +2,13 @@
 grimx.cmake_patch
 Automatically patch CMakeLists.txt after a package is installed.
 
-Two patching strategies:
+Primary path — vcpkg output hints (used after grimx install):
+  Parses CMake hints from vcpkg stdout in one pass. Fast, no filesystem access.
 
-  Primary — vcpkg output hints (used after grimx install):
-    vcpkg prints CMake hints for every installed package after each install
-    run. grimx parses all of them from stdout in one pass. Fast, no
-    filesystem access, works for every package vcpkg prints hints for.
-
-  Fallback — filesystem layers (used for grimx install restore from lock):
-    Layer 1: vcpkg usage file   — fast, no subprocess, covers most ports
-    Layer 2: CMake probe        — authoritative for everything else;
-                                  runs find_package() and reports IMPORTED
-                                  targets directly from CMake's resolver
-    Layer 3: pkg-config         — last resort for Conan/system libs
+Fallback path — filesystem layers (used for grimx install restore):
+  Layer 1: vcpkg usage file
+  Layer 2: CMake probe via find_package()
+  Layer 3: pkg-config
 """
 
 from __future__ import annotations
@@ -28,10 +22,6 @@ from pathlib import Path
 import click
 
 
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
-
 @dataclass
 class UsageDirectives:
     find_package:    list[str] = field(default_factory=list)
@@ -39,15 +29,8 @@ class UsageDirectives:
     find_path_lines: list[str] = field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-# Primary path — parse vcpkg install output
-# ---------------------------------------------------------------------------
-
 def parse_vcpkg_output_hints(output: str) -> dict[str, UsageDirectives]:
-    """
-    Parse ALL CMake hints from vcpkg install stdout in one pass.
-    Returns {package_name: UsageDirectives} for every package mentioned.
-    """
+    """Parse all CMake hints from vcpkg install stdout in one pass."""
     results: dict[str, UsageDirectives] = {}
 
     section_re = re.compile(
@@ -105,10 +88,7 @@ def parse_vcpkg_output_hints(output: str) -> dict[str, UsageDirectives]:
 
 
 def patch_from_vcpkg_output(output: str, cmake_path: Path) -> None:
-    """
-    Parse vcpkg install output and patch CMakeLists.txt for all packages.
-    Called after every successful grimx install.
-    """
+    """Parse vcpkg install output and patch CMakeLists.txt for all packages."""
     if not cmake_path.exists():
         return
 
@@ -117,8 +97,8 @@ def patch_from_vcpkg_output(output: str, cmake_path: Path) -> None:
         click.echo("  [cmake] no CMake hints found in vcpkg output.")
         return
 
-    content    = cmake_path.read_text()
-    normalised = _normalise(content)
+    content     = cmake_path.read_text()
+    normalised  = _normalise(content)
     any_changed = False
 
     for package, directives in hints.items():
@@ -136,15 +116,8 @@ def patch_from_vcpkg_output(output: str, cmake_path: Path) -> None:
         click.echo("  [cmake] CMakeLists.txt already up to date.")
 
 
-# ---------------------------------------------------------------------------
-# Fallback path — filesystem layers (restore from lock)
-# ---------------------------------------------------------------------------
-
 def patch_all_from_lock(lock: dict, cmake_path: Path) -> None:
-    """
-    Patch CMakeLists.txt for every package in grimx.lock.
-    Used by grimx install (restore) where there is no fresh vcpkg output.
-    """
+    """Patch CMakeLists.txt for every package in grimx.lock."""
     if not cmake_path.exists():
         return
 
@@ -175,21 +148,8 @@ def patch_all_from_lock(lock: dict, cmake_path: Path) -> None:
         click.echo("  [cmake] CMakeLists.txt already up to date.")
 
 
-# ---------------------------------------------------------------------------
-# Sync — update add_executable and target_include_directories from disk
-# ---------------------------------------------------------------------------
-
 def sync_sources(cmake_path: Path) -> None:
-    """
-    Scan src/ and include/ and sync CMakeLists.txt to match.
-
-    - Adds any .c/.cpp files found in src/ that are missing from
-      add_executable(...)
-    - Adds target_include_directories(...PRIVATE include) if include/ exists
-      and is not already referenced
-
-    Idempotent — safe to run multiple times. Atomic write.
-    """
+    """Sync CMakeLists.txt with source files found in src/ and include/."""
     if not cmake_path.exists():
         click.echo("  [sync] CMakeLists.txt not found.", err=True)
         return
@@ -198,7 +158,6 @@ def sync_sources(cmake_path: Path) -> None:
     src_dir      = project_root / "src"
     include_dir  = project_root / "include"
 
-    # --- Discover source files ---
     src_extensions = {".c", ".cpp", ".cc", ".cxx"}
     discovered: list[str] = []
     if src_dir.exists():
@@ -208,17 +167,15 @@ def sync_sources(cmake_path: Path) -> None:
             if f.is_file() and f.suffix in src_extensions
         )
 
-    content    = cmake_path.read_text()
+    content     = cmake_path.read_text()
     any_changed = False
 
-    # --- Sync add_executable ---
     if discovered:
         content, changed = _sync_add_executable(content, discovered)
         if changed:
             click.echo(f"  [sync] updated add_executable with {len(discovered)} source(s)")
             any_changed = True
 
-    # --- Sync target_include_directories ---
     if include_dir.exists():
         content, changed = _sync_include_directories(content)
         if changed:
@@ -229,19 +186,12 @@ def sync_sources(cmake_path: Path) -> None:
         click.echo("  [sync] CMakeLists.txt already up to date.")
         return
 
-    # Collapse any triple+ blank lines introduced by edits
     content = re.sub(r'\n{3,}', '\n\n', content)
     _atomic_write(cmake_path, content)
     click.echo("  [sync] ✓ CMakeLists.txt updated.")
 
 
 def _sync_add_executable(content: str, discovered: list[str]) -> tuple[str, bool]:
-    """
-    Add any discovered source files missing from add_executable(...).
-    Handles both single-line and multi-line calls.
-    Uses _extract_cmake_calls + _find_call_end for safe balanced-paren parsing.
-    """
-    # Find the add_executable call
     ae_re = re.compile(r'add_executable\s*\(', re.IGNORECASE)
     m     = ae_re.search(content)
     if not m:
@@ -251,52 +201,34 @@ def _sync_add_executable(content: str, discovered: list[str]) -> tuple[str, bool
     if end == -1:
         return content, False
 
-    call_text = content[m.start():end]
-
-    # Extract tokens inside add_executable(...)
-    # First token after '(' is the target name — skip it
-    inner = call_text[call_text.index('(') + 1 : -1].strip()
-    tokens = inner.split()
+    call_text        = content[m.start():end]
+    inner            = call_text[call_text.index('(') + 1:-1].strip()
+    tokens           = inner.split()
     if not tokens:
         return content, False
 
-    # target name is always first token
     existing_sources = set(tokens[1:])
     norm_existing    = {_normalise(s) for s in existing_sources}
+    missing          = [s for s in discovered if _normalise(s) not in norm_existing]
 
-    missing = [
-        src for src in discovered
-        if _normalise(src) not in norm_existing
-    ]
     if not missing:
         return content, False
 
-    # Append missing sources before the closing paren — string slice only
-    new_sources_str = "\n    " + "\n    ".join(missing)
-    new_call        = call_text[:-1] + new_sources_str + "\n)"
+    new_call = call_text[:-1] + "\n    " + "\n    ".join(missing) + "\n)"
     return content[:m.start()] + new_call + content[end:], True
 
 
 def _sync_include_directories(content: str) -> tuple[str, bool]:
-    """
-    Ensure target_include_directories(... PRIVATE include) is present.
-    If a target_include_directories call already exists and contains
-    'include', skip. Otherwise create one after add_executable.
-    """
     norm = _normalise(content)
 
-    # Already has an include dir referencing 'include' path
     if 'target_include_directories' in norm and _normalise('include') in norm:
-        # More precise: check the actual call contains 'include' as a token
         tid_re = re.compile(r'target_include_directories\s*\(.*?\)', re.DOTALL | re.IGNORECASE)
         for m in tid_re.finditer(content):
-            tokens = m.group().split()
-            if any(t.strip('()') == 'include' for t in tokens):
+            if any(t.strip('()') == 'include' for t in m.group().split()):
                 return content, False
 
     new_line = "target_include_directories(${PROJECT_NAME} PRIVATE include)"
 
-    # Inject after add_executable call
     ae_re = re.compile(r'add_executable\s*\(', re.IGNORECASE)
     m     = ae_re.search(content)
     if m:
@@ -304,13 +236,8 @@ def _sync_include_directories(content: str) -> tuple[str, bool]:
         if end != -1:
             return content[:end] + "\n\n" + new_line + content[end:], True
 
-    # Fallback: append at end
     return content.rstrip() + "\n\n" + new_line + "\n", True
 
-
-# ---------------------------------------------------------------------------
-# Unpatch — reverse cmake patch for a removed package
-# ---------------------------------------------------------------------------
 
 def unpatch_package(
     package: str,
@@ -319,41 +246,29 @@ def unpatch_package(
 ) -> None:
     """
     Remove CMake directives for a package from CMakeLists.txt.
-    Called after grimx remove <package>.
-
-    Accepts pre-resolved directives so the caller can resolve them before
-    vcpkg_installed/ is mutated by reconcile. Falls back to filesystem
-    resolution if directives are not provided.
-
-    Removes find_package/find_path lines and link targets in one pass.
-    If a target_link_libraries call is left empty after removal, the entire
-    call is removed. Collapses any resulting triple blank lines to double.
+    Accepts pre-resolved directives to avoid dependency on vcpkg_installed/
+    being intact at call time.
     """
     if not cmake_path.exists():
         return
 
     if directives is None:
-        project_root = cmake_path.parent
-        directives   = _resolve_directives(package, project_root)
+        directives = _resolve_directives(package, cmake_path.parent)
 
     if directives is None:
         click.echo(f"  [cmake] no directives found for '{package}' — nothing to remove.")
         return
 
     content     = cmake_path.read_text()
-    original    = content
     any_changed = False
 
-    # --- Remove find_package / find_path lines (all occurrences) ---
     for line in directives.find_package + directives.find_path_lines:
         norm_line = _normalise(line)
-        # Keep removing while it still exists (handles manual duplicates)
         while norm_line in _normalise(content):
             content, removed = _remove_cmake_call(content, line)
             if removed:
                 any_changed = True
 
-    # --- Remove link targets from all target_link_libraries calls ---
     for target in directives.link_targets:
         content, changed = _remove_link_target(content, target)
         if changed:
@@ -363,30 +278,21 @@ def unpatch_package(
         click.echo(f"  [cmake] '{package}' directives not found in CMakeLists.txt — nothing to remove.")
         return
 
-    # Collapse triple+ blank lines to double
     content = re.sub(r'\n{3,}', '\n\n', content)
-
     _atomic_write(cmake_path, content)
     click.echo(f"  [cmake] ✓ removed '{package}' directives from CMakeLists.txt.")
 
 
 def _remove_cmake_call(content: str, call: str) -> tuple[str, bool]:
-    """
-    Remove a single CMake call from content by matching normalised form.
-    Also strips one surrounding blank line to avoid accumulating whitespace.
-    Returns (new_content, changed).
-    """
     norm_target = _normalise(call)
-
-    # Walk through all top-level calls and find the matching one by position
-    call_re = re.compile(r'[A-Za-z_]\w*\s*\(')
+    call_re     = re.compile(r'[A-Za-z_]\w*\s*\(')
     i = 0
+
     while i < len(content):
         m = call_re.search(content, i)
         if not m:
             break
 
-        # Skip commented calls
         line_start = content.rfind('\n', 0, m.start()) + 1
         if '#' in content[line_start:m.start()]:
             i = m.end()
@@ -397,9 +303,7 @@ def _remove_cmake_call(content: str, call: str) -> tuple[str, bool]:
             i = m.end()
             continue
 
-        candidate = content[m.start():end]
-        if _normalise(candidate) == norm_target:
-            # Expand removal to include one leading blank line if present
+        if _normalise(content[m.start():end]) == norm_target:
             remove_start = m.start()
             if remove_start >= 2 and content[remove_start - 2:remove_start] == '\n\n':
                 remove_start -= 1
@@ -411,30 +315,22 @@ def _remove_cmake_call(content: str, call: str) -> tuple[str, bool]:
 
 
 def _remove_link_target(content: str, target: str) -> tuple[str, bool]:
-    """
-    Remove a single target token from every target_link_libraries call.
-    Uses string slicing throughout — no re.sub replacement strings — so
-    targets containing ${VAR} are handled safely.
-
-    If a call is left with no targets after removal, the entire call is
-    removed (including one surrounding blank line).
-    """
+    """Remove a target token from every TLL call. Uses string slicing — safe for ${VAR} targets."""
     tll_re = re.compile(
         r'target_link_libraries\s*\(\s*'
-        r'(?:\$\{[^}]+\}|\w+)\s+'          # target name (variable or plain)
-        r'(PRIVATE|PUBLIC|INTERFACE)\s+'    # visibility keyword
-        r'(.*?)\s*\)',                       # targets list
+        r'(?:\$\{[^}]+\}|\w+)\s+'
+        r'(PRIVATE|PUBLIC|INTERFACE)\s+'
+        r'(.*?)\s*\)',
         re.DOTALL,
     )
 
-    changed  = False
-    result   = content
-    offset   = 0
+    changed = False
+    result  = content
+    offset  = 0
 
     for m in tll_re.finditer(content):
         visibility = m.group(1)
-        targets_str = m.group(2)
-        tokens = targets_str.split()
+        tokens     = m.group(2).split()
 
         if target not in tokens:
             continue
@@ -443,29 +339,21 @@ def _remove_link_target(content: str, target: str) -> tuple[str, bool]:
         changed = True
 
         if tokens:
-            # Rebuild call with target removed — slice-based, no re.sub
             new_targets = ' '.join(tokens)
-            # Reconstruct: everything up to visibility keyword + new targets + )
-            vis_start = m.start(1) + offset
-            close_pos = m.end() - 1 + offset   # position of closing )
-            result = result[:vis_start] + visibility + ' ' + new_targets + result[close_pos:]
-            offset += len(visibility + ' ' + new_targets) - (close_pos - vis_start)
+            vis_start   = m.start(1) + offset
+            close_pos   = m.end() - 1 + offset
+            result      = result[:vis_start] + visibility + ' ' + new_targets + result[close_pos:]
+            offset     += len(visibility + ' ' + new_targets) - (close_pos - vis_start)
         else:
-            # No targets left — remove the entire call
             abs_start = m.start() + offset
             abs_end   = m.end() + offset
-            # Also remove one preceding blank line if present
             if abs_start >= 2 and result[abs_start - 2:abs_start] == '\n\n':
                 abs_start -= 1
-            result = result[:abs_start] + result[abs_end:]
+            result  = result[:abs_start] + result[abs_end:]
             offset -= (abs_end - abs_start)
 
     return result, changed
 
-
-# ---------------------------------------------------------------------------
-# Apply directives
-# ---------------------------------------------------------------------------
 
 def _apply_directives(
     content: str,
@@ -489,40 +377,26 @@ def _apply_directives(
     return content, normalised, changed
 
 
-# ---------------------------------------------------------------------------
-# Atomic write
-# ---------------------------------------------------------------------------
-
 def _atomic_write(cmake_path: Path, content: str) -> None:
     tmp = cmake_path.with_suffix(".tmp")
     tmp.write_text(content)
     tmp.replace(cmake_path)
 
 
-# ---------------------------------------------------------------------------
-# Filesystem layer resolution
-# ---------------------------------------------------------------------------
-
 def _resolve_directives(
     package: str, project_root: Path
 ) -> UsageDirectives | None:
-
-    share_dirs = _find_package_share_dirs(package, project_root)
-
-    # Layer 1: vcpkg usage file — fast, no subprocess
-    for share_dir in share_dirs:
+    for share_dir in _find_package_share_dirs(package, project_root):
         usage = share_dir / "usage"
         if usage.exists():
             d = _parse_usage_file(usage.read_text())
             if d.find_package or d.find_path_lines:
                 return d
 
-    # Layer 2: CMake probe — authoritative, works for everything
     d = _query_cmake_targets(package, project_root)
     if d:
         return d
 
-    # Layer 3: pkg-config — last resort for Conan/system libs
     return _parse_pkgconfig(package, project_root)
 
 
@@ -537,19 +411,11 @@ def _find_package_share_dirs(package: str, project_root: Path) -> list[Path]:
     ]
 
 
-# ---------------------------------------------------------------------------
-# Layer 1 — vcpkg usage file parser
-# ---------------------------------------------------------------------------
-
 _ALTERNATIVE_RE = re.compile(r'#\s*or\b', re.IGNORECASE)
 
 
 def _parse_usage_file(content: str) -> UsageDirectives:
-    d = UsageDirectives()
-
-    # Split on blank lines AND on inline '# Or' comment lines so that
-    # alternative blocks (e.g. header-only variants) never poison the
-    # primary block — mirrors the logic in parse_vcpkg_output_hints.
+    d      = UsageDirectives()
     blocks = re.split(r'\n\s*\n|(?=\n\s*#\s*[Oo]r\b)', content.strip())
 
     for block in blocks:
@@ -578,10 +444,6 @@ def _parse_usage_file(content: str) -> UsageDirectives:
     return d
 
 
-# ---------------------------------------------------------------------------
-# Layer 2 — CMake probe (authoritative)
-# ---------------------------------------------------------------------------
-
 def _query_cmake_targets(
     package: str, project_root: Path
 ) -> UsageDirectives | None:
@@ -593,8 +455,7 @@ def _query_cmake_targets(
     if not triplet_dirs:
         return None
 
-    prefix = triplet_dirs[0]
-
+    prefix       = triplet_dirs[0]
     cmake_script = f'''\
 cmake_minimum_required(VERSION 3.20)
 project(grimx_probe LANGUAGES NONE)
@@ -625,9 +486,9 @@ endif()
 '''
 
     with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = Path(tmp)
-        (tmp_path / "CMakeLists.txt").write_text(cmake_script)
+        tmp_path   = Path(tmp)
         build_path = tmp_path / "build"
+        (tmp_path / "CMakeLists.txt").write_text(cmake_script)
         build_path.mkdir()
 
         result = subprocess.run(
@@ -641,8 +502,7 @@ endif()
 
         for line in combined.splitlines():
             if "GRIMX_TARGET:" in line:
-                t = line.split("GRIMX_TARGET:")[-1].strip()
-                all_targets.append(t)
+                all_targets.append(line.split("GRIMX_TARGET:")[-1].strip())
             elif "GRIMX_PKG:" in line:
                 parts = line.split("GRIMX_PKG:")[-1].strip().split(":")
                 if len(parts) == 2:
@@ -651,16 +511,14 @@ endif()
         if not all_targets:
             return None
 
-        pkg_key  = package.lower().replace("-", "").replace("_", "")
-        relevant = [
+        pkg_key       = package.lower().replace("-", "").replace("_", "")
+        relevant      = [
             t for t in all_targets
             if pkg_key in t.lower().replace("::", "").replace("_", "").replace("-", "")
         ]
         final_targets = relevant if relevant else all_targets
-
-        ns = [t for t in final_targets if "::" in t]
-        final_targets = ns if ns else final_targets
-        final_targets = list(dict.fromkeys(final_targets))
+        ns            = [t for t in final_targets if "::" in t]
+        final_targets = list(dict.fromkeys(ns if ns else final_targets))
 
         if not final_targets:
             return None
@@ -671,15 +529,8 @@ endif()
             else f"find_package({package} REQUIRED)"
         )
 
-        return UsageDirectives(
-            find_package=[find_pkg],
-            link_targets=final_targets,
-        )
+        return UsageDirectives(find_package=[find_pkg], link_targets=final_targets)
 
-
-# ---------------------------------------------------------------------------
-# Layer 3 — pkg-config fallback
-# ---------------------------------------------------------------------------
 
 def _parse_pkgconfig(
     package: str, project_root: Path
@@ -711,10 +562,6 @@ def _parse_pkgconfig(
     )
 
 
-# ---------------------------------------------------------------------------
-# Balanced-paren CMake call extractor
-# ---------------------------------------------------------------------------
-
 def _extract_cmake_calls(text: str) -> list[str]:
     calls      = []
     i          = 0
@@ -726,8 +573,7 @@ def _extract_cmake_calls(text: str) -> list[str]:
             break
 
         line_start = text.rfind('\n', 0, m.start()) + 1
-        prefix     = text[line_start:m.start()]
-        if '#' in prefix:
+        if '#' in text[line_start:m.start()]:
             i = m.end()
             continue
 
@@ -750,18 +596,9 @@ def _extract_cmake_calls(text: str) -> list[str]:
     return calls
 
 
-# ---------------------------------------------------------------------------
-# Normalisation
-# ---------------------------------------------------------------------------
-
 def _normalise(s: str) -> str:
-    """Collapse whitespace and lowercase for robust idempotency checks."""
     return re.sub(r'\s+', '', s).lower()
 
-
-# ---------------------------------------------------------------------------
-# Injection helpers
-# ---------------------------------------------------------------------------
 
 def _inject_find_package(content: str, find_pkg: str) -> str:
     last = None
@@ -775,9 +612,20 @@ def _inject_find_package(content: str, find_pkg: str) -> str:
         if end != -1:
             return f"{content[:end]}\n\n{find_pkg}{content[end:]}"
 
+    prefix_m = re.search(
+        r'list\s*\(\s*APPEND\s+CMAKE_PREFIX_PATH\b[^\)]*\)',
+        content, re.IGNORECASE,
+    )
+    if prefix_m:
+        end = _find_call_end(content, prefix_m.start())
+        pos = end if end != -1 else prefix_m.end()
+        return f"{content[:pos]}\n\n{find_pkg}{content[pos:]}"
+
     anchors = [
         r'set\s*\(\s*CMAKE_CXX_STANDARD_REQUIRED\s+ON\s*\)',
+        r'set\s*\(\s*CMAKE_C_STANDARD_REQUIRED\s+ON\s*\)',
         r'set\s*\(\s*CMAKE_CXX_STANDARD\b[^\)]*\)',
+        r'set\s*\(\s*CMAKE_C_STANDARD\b[^\)]*\)',
         r'project\s*\([^\)]*\)',
         r'cmake_minimum_required\s*\([^\)]*\)',
     ]
@@ -796,6 +644,26 @@ def _inject_find_package(content: str, find_pkg: str) -> str:
 
 
 def _inject_link_target(content: str, target: str) -> str:
+    core_tll = re.compile(
+        r'(target_link_libraries\(\s*(?:\$\{PROJECT_NAME\}|\w+)_core\s+'
+        r'(?:PRIVATE|PUBLIC|INTERFACE))(.*?)(\))',
+        re.DOTALL,
+    )
+    m = core_tll.search(content)
+    if m:
+        replacement = m.group(1) + m.group(2) + f" {target}" + m.group(3)
+        return content[:m.start()] + replacement + content[m.end():]
+
+    core_lib = re.compile(
+        r'(add_library\(\s*(?:\$\{PROJECT_NAME\}|\w+)_core\b[^\)]*\))',
+        re.DOTALL,
+    )
+    m = core_lib.search(content)
+    if m:
+        end = _find_call_end(content, m.start())
+        pos = end if end != -1 else m.end()
+        return content[:pos] + f"\ntarget_link_libraries(${{PROJECT_NAME}}_core PUBLIC {target})" + content[pos:]
+
     tll = re.compile(
         r'(target_link_libraries\(\s*(?:\$\{PROJECT_NAME\}|\w+)\s+'
         r'(?:PRIVATE|PUBLIC|INTERFACE))(.*?)(\))',
@@ -809,15 +677,14 @@ def _inject_link_target(content: str, target: str) -> str:
     ae = re.compile(r'(add_(?:executable|library)\([^\)]+\))', re.DOTALL)
     if ae.search(content):
         return ae.sub(
-            rf'\1\n\ntarget_link_libraries(${{PROJECT_NAME}} PRIVATE {target})',
+            rf'\1\n\ntarget_link_libraries(${{PROJECT_NAME}}_core PUBLIC {target})',
             content, count=1,
         )
 
-    return f"{content}\ntarget_link_libraries(${{PROJECT_NAME}} PRIVATE {target})\n"
+    return f"{content}\ntarget_link_libraries(${{PROJECT_NAME}}_core PUBLIC {target})\n"
 
 
 def _find_call_end(text: str, start: int) -> int:
-    """Return index just after the matching closing paren. -1 if unmatched."""
     depth = 0
     for i in range(start, len(text)):
         if text[i] == '(':
