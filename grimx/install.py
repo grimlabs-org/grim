@@ -168,7 +168,15 @@ def _install_package(package: str, dev: bool = False) -> None:
             if manager == "vcpkg":
                 _sync_vcpkg_manifest()
                 click.echo(f"  ✓ vcpkg.json updated")
-                patch_from_vcpkg_output(vcpkg_output, cmake_target)
+                if dev:
+                    patch_from_vcpkg_output(vcpkg_output, cmake_target)
+                else:
+                    dev_dep_names = set(load_lock().get("dev_dependencies", {}).keys())
+                    patch_from_vcpkg_output(
+                        vcpkg_output,
+                        cmake_target,
+                        exclude=dev_dep_names,
+                    )
             else:
                 patch_all_from_lock(load_lock(), cmake_target)
             return

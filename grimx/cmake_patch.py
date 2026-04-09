@@ -33,8 +33,13 @@ def parse_vcpkg_output_hints(output: str) -> dict[str, UsageDirectives]:
     """Parse all CMake hints from vcpkg install stdout in one pass."""
     results: dict[str, UsageDirectives] = {}
 
+    # Match all known vcpkg phrasing variants:
+    #   "The package fmt provides CMake targets:"
+    #   "fmt provides CMake targets:"
+    #   "The package zlib is compatible with built-in CMake targets:"
+    #   "zlib is compatible with built-in CMake targets:"
     section_re = re.compile(
-        r'(?:The package\s+)?(\S+)\s+provides CMake(?:\s+targets)?:',
+        r'(?:The package\s+)?(\S+)\s+(?:provides|is compatible with built-in)\s+CMake(?:\s+targets)?:',
         re.IGNORECASE,
     )
 
@@ -49,7 +54,7 @@ def parse_vcpkg_output_hints(output: str) -> dict[str, UsageDirectives]:
         content = re.split(r'\n\S.*provides\s', content)[0]
 
         d = UsageDirectives()
-        sub_blocks = re.split(r'\n\s*\n', content.strip())
+        sub_blocks = re.split(r'\n\s*\n|(?=\n\s*#\s*[Oo]r\b)', content.strip())
 
         for block in sub_blocks:
             lines = block.strip().splitlines()
