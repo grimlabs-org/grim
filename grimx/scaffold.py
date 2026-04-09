@@ -11,7 +11,7 @@ from pathlib import Path
 
 import click
 
-from grimx.config import write_config, write_lock, DEFAULT_CONFIG
+from grimx.config import write_config, write_lock, add_dev_dependency, DEFAULT_CONFIG
 
 TEMPLATE_MAP = {
     "c":            "c",
@@ -24,6 +24,9 @@ PROJECT_TYPES  = ["cpp", "c", "embedded-cpp", "embedded-c"]
 CPP_STANDARDS  = ["17", "20", "14"]
 C_STANDARDS    = ["11", "17", "99"]
 MANAGERS       = ["vcpkg", "conan", "both", "none"]
+
+CPP_TEST_FRAMEWORKS = ["catch2", "doctest", "googletest", "none"]
+C_TEST_FRAMEWORKS   = ["unity", "cmocka", "none"]
 
 
 def create_project(name: str | None, project_type: str | None) -> None:
@@ -92,12 +95,29 @@ def create_project(name: str | None, project_type: str | None) -> None:
     else:
         priority = [mgr]
 
+    # ── Test framework ────────────────────────────────────────────────────
+    test_frameworks = CPP_TEST_FRAMEWORKS if is_cpp else C_TEST_FRAMEWORKS
+    default_fw      = test_frameworks[0]
+
+    click.echo("")
+    click.echo("  Test framework?")
+    for i, fw in enumerate(test_frameworks, 1):
+        marker = " (default)" if fw == default_fw else ""
+        label  = fw if fw != "none" else "none (configure manually)"
+        click.echo(f"    {i}. {label}{marker}")
+    fw_choice = click.prompt("  Choice", default="1", show_default=False)
+    try:
+        test_framework = test_frameworks[int(fw_choice) - 1]
+    except (ValueError, IndexError):
+        test_framework = default_fw
+
     # ── Summary ───────────────────────────────────────────────────────────
     click.echo("")
     click.echo(f"  Creating project '{name}'")
-    click.echo(f"    type     : {project_type}")
-    click.echo(f"    standard : {lang}{std}")
-    click.echo(f"    managers : {', '.join(priority) if priority else 'none'}")
+    click.echo(f"    type      : {project_type}")
+    click.echo(f"    standard  : {lang}{std}")
+    click.echo(f"    managers  : {', '.join(priority) if priority else 'none'}")
+    click.echo(f"    tests     : {test_framework}")
     click.echo("")
 
     # ── Scaffold ──────────────────────────────────────────────────────────
@@ -108,31 +128,190 @@ def create_project(name: str | None, project_type: str | None) -> None:
         gitkeep.unlink()
 
     _patch_cmakelists(dest, name, project_type, std)
+    _write_tests_cmake(dest, name, project_type, test_framework)
+    _write_starter_test(dest, project_type, test_framework)
     _write_readme(dest, name, project_type, std)
     _write_gitignore(dest)
     _write_clang_format(dest)
 
-    # Ensure all expected directories exist
     for d in ["include", "docs", "cmake"]:
         (dest / d).mkdir(exist_ok=True)
 
     write_config({"package_manager": {"priority": priority}}, root=dest)
-    write_lock({"dependencies": {}}, root=dest)
+    write_lock({"dependencies": {}, "dev_dependencies": {}}, root=dest)
+
+    if test_framework != "none" and priority:
+        add_dev_dependency(test_framework, "vcpkg", "unknown", root=dest)
 
     click.echo(f"  ✓ {dest}")
     click.echo("")
+
+    if test_framework != "none" and priority:
+        click.echo(f"  The following will be installed:")
+        click.echo(f"    {test_framework} (dev dependency, via vcpkg)")
+        click.echo("")
+        if click.confirm("  Install now?", default=True):
+            import os
+            orig = os.getcwd()
+            os.chdir(dest)
+            try:
+                from grimx import install as install_mod
+                install_mod.run(None)
+            finally:
+                os.chdir(orig)
+            click.echo("")
+
     click.echo("  Next steps:")
     click.echo(f"    cd {name}")
-    if priority:
-        click.echo(f"    grimx install <package>")
     click.echo(f"    grimx build")
     click.echo(f"    grimx run")
+    click.echo(f"    grimx test")
     click.echo("")
 
 
 # ---------------------------------------------------------------------------
 # Patching and file generation
 # ---------------------------------------------------------------------------
+
+def _write_tests_cmake(dest: Path, name: str, project_type: str, framework: str) -> None:
+    tests_cmake = dest / "tests" / "CMakeLists.txt"
+    tests_cmake.parent.mkdir(exist_ok=True)
+    is_cpp = "cpp" in project_type
+
+    if framework == "none":
+        tests_cmake.write_text(
+            "# Add test executables here.\n"
+            "# Example:\n"
+            "#   find_package(Catch2 CONFIG REQUIRED)\n"
+            "#   add_executable(my_tests test_main.cpp)\n"
+            "#   target_link_libraries(my_tests PRIVATE\n"
+            f"#       {name}_core\n"
+            "#       Catch2::Catch2WithMain\n"
+            "#   )\n"
+            "#   add_test(NAME my_tests COMMAND my_tests)\n"
+        )
+        return
+
+    glob_ext = "*.cpp" if is_cpp else "*.c"
+
+    if framework == "catch2":
+        tests_cmake.write_text(
+            f"find_package(Catch2 CONFIG REQUIRED)\n\n"
+            f"file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS {glob_ext})\n"
+            f"add_executable({name}_tests ${{TEST_SOURCES}})\n"
+            f"target_link_libraries({name}_tests PRIVATE\n"
+            f"    {name}_core\n"
+            f"    Catch2::Catch2WithMain\n"
+            f")\n"
+            f"add_test(NAME {name}_tests COMMAND {name}_tests)\n"
+        )
+    elif framework == "doctest":
+        tests_cmake.write_text(
+            f"find_package(doctest CONFIG REQUIRED)\n\n"
+            f"file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS {glob_ext})\n"
+            f"add_executable({name}_tests ${{TEST_SOURCES}})\n"
+            f"target_link_libraries({name}_tests PRIVATE\n"
+            f"    {name}_core\n"
+            f"    doctest::doctest\n"
+            f")\n"
+            f"add_test(NAME {name}_tests COMMAND {name}_tests)\n"
+        )
+    elif framework == "googletest":
+        tests_cmake.write_text(
+            f"find_package(GTest CONFIG REQUIRED)\n\n"
+            f"file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS {glob_ext})\n"
+            f"add_executable({name}_tests ${{TEST_SOURCES}})\n"
+            f"target_link_libraries({name}_tests PRIVATE\n"
+            f"    {name}_core\n"
+            f"    GTest::gtest_main\n"
+            f")\n"
+            f"add_test(NAME {name}_tests COMMAND {name}_tests)\n"
+        )
+    elif framework == "unity":
+        tests_cmake.write_text(
+            f"find_package(unity CONFIG REQUIRED)\n\n"
+            f"file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS {glob_ext})\n"
+            f"add_executable({name}_tests ${{TEST_SOURCES}})\n"
+            f"target_link_libraries({name}_tests PRIVATE\n"
+            f"    {name}_core\n"
+            f"    unity\n"
+            f")\n"
+            f"add_test(NAME {name}_tests COMMAND {name}_tests)\n"
+        )
+    elif framework == "cmocka":
+        tests_cmake.write_text(
+            f"find_package(cmocka CONFIG REQUIRED)\n\n"
+            f"file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS {glob_ext})\n"
+            f"add_executable({name}_tests ${{TEST_SOURCES}})\n"
+            f"target_link_libraries({name}_tests PRIVATE\n"
+            f"    {name}_core\n"
+            f"    cmocka::cmocka\n"
+            f")\n"
+            f"add_test(NAME {name}_tests COMMAND {name}_tests)\n"
+        )
+
+
+def _write_starter_test(dest: Path, project_type: str, framework: str) -> None:
+    if framework == "none":
+        return
+
+    is_cpp  = "cpp" in project_type
+    ext     = ".cpp" if is_cpp else ".c"
+    outfile = dest / "tests" / f"test_main{ext}"
+
+    if framework == "catch2":
+        outfile.write_text(
+            '#include <catch2/catch_test_macros.hpp>\n\n'
+            'TEST_CASE("placeholder", "[core]") {\n'
+            '    REQUIRE(1 + 1 == 2);\n'
+            '}\n'
+        )
+    elif framework == "doctest":
+        outfile.write_text(
+            '#include <doctest/doctest.h>\n\n'
+            'TEST_CASE("placeholder") {\n'
+            '    CHECK(1 + 1 == 2);\n'
+            '}\n'
+        )
+    elif framework == "googletest":
+        outfile.write_text(
+            '#include <gtest/gtest.h>\n\n'
+            'TEST(Placeholder, BasicAssertion) {\n'
+            '    EXPECT_EQ(1 + 1, 2);\n'
+            '}\n'
+        )
+    elif framework == "unity":
+        outfile.write_text(
+            '#include <unity.h>\n\n'
+            'void setUp(void) {}\n'
+            'void tearDown(void) {}\n\n'
+            'void test_placeholder(void) {\n'
+            '    TEST_ASSERT_EQUAL(2, 1 + 1);\n'
+            '}\n\n'
+            'int main(void) {\n'
+            '    UNITY_BEGIN();\n'
+            '    RUN_TEST(test_placeholder);\n'
+            '    return UNITY_END();\n'
+            '}\n'
+        )
+    elif framework == "cmocka":
+        outfile.write_text(
+            '#include <stdarg.h>\n'
+            '#include <stddef.h>\n'
+            '#include <setjmp.h>\n'
+            '#include <cmocka.h>\n\n'
+            'static void test_placeholder(void **state) {\n'
+            '    (void)state;\n'
+            '    assert_int_equal(1 + 1, 2);\n'
+            '}\n\n'
+            'int main(void) {\n'
+            '    const struct CMUnitTest tests[] = {\n'
+            '        cmocka_unit_test(test_placeholder),\n'
+            '    };\n'
+            '    return cmocka_run_group_tests(tests, NULL, NULL);\n'
+            '}\n'
+        )
+
 
 def _patch_cmakelists(dest: Path, name: str, project_type: str, std: str) -> None:
     cmake = dest / "CMakeLists.txt"

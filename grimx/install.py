@@ -16,7 +16,11 @@ from pathlib import Path
 
 import click
 
-from grimx.config import load_config, load_lock, add_dependency, remove_dependency
+from grimx.config import (
+    load_config, load_lock,
+    add_dependency, add_dev_dependency,
+    remove_dependency,
+)
 from grimx.cmake_patch import (
     patch_from_vcpkg_output,
     patch_all_from_lock,
@@ -29,9 +33,9 @@ from grimx.cmake_patch import (
 # Public API
 # ---------------------------------------------------------------------------
 
-def run(package: str | None) -> None:
+def run(package: str | None, dev: bool = False) -> None:
     if package:
-        _install_package(package)
+        _install_package(package, dev=dev)
     else:
         _restore_from_lock()
 
@@ -133,7 +137,7 @@ def upgrade(package: str) -> None:
 # Install / restore
 # ---------------------------------------------------------------------------
 
-def _install_package(package: str) -> None:
+def _install_package(package: str, dev: bool = False) -> None:
     cfg = load_config()
     priority: list[str] = cfg.get("package_manager", {}).get("priority", [])
 
@@ -145,6 +149,8 @@ def _install_package(package: str) -> None:
         )
         raise SystemExit(1)
 
+    cmake_target = Path.cwd() / "tests" / "CMakeLists.txt" if dev else Path.cwd() / "CMakeLists.txt"
+
     for manager in priority:
         if not _is_manager_available(manager):
             if not _prompt_and_install_manager(manager):
@@ -153,15 +159,18 @@ def _install_package(package: str) -> None:
         click.echo(f"  trying {manager}...")
         ok, version, vcpkg_output = _try_install(manager, package)
         if ok:
-            add_dependency(package, manager, version)
+            if dev:
+                add_dev_dependency(package, manager, version)
+            else:
+                add_dependency(package, manager, version)
             click.echo(f"  ✓ installed {package}=={version} via {manager}")
             click.echo(f"  ✓ grimx.lock updated")
             if manager == "vcpkg":
                 _sync_vcpkg_manifest()
                 click.echo(f"  ✓ vcpkg.json updated")
-                patch_from_vcpkg_output(vcpkg_output, Path.cwd() / "CMakeLists.txt")
+                patch_from_vcpkg_output(vcpkg_output, cmake_target)
             else:
-                patch_all_from_lock(load_lock(), Path.cwd() / "CMakeLists.txt")
+                patch_all_from_lock(load_lock(), cmake_target)
             return
 
     click.echo(
@@ -174,38 +183,63 @@ def _install_package(package: str) -> None:
 
 def _restore_from_lock() -> None:
     lock = load_lock()
-    deps: dict = lock.get("dependencies", {})
+    deps:     dict = lock.get("dependencies", {})
+    dev_deps: dict = lock.get("dev_dependencies", {})
 
-    if not deps:
+    total = len(deps) + len(dev_deps)
+    if not total:
         click.echo("grimx.lock is empty — nothing to install.")
         return
 
-    click.echo(f"Restoring {len(deps)} dependencies from grimx.lock...")
+    click.echo(f"Restoring {len(deps)} dependencies and {len(dev_deps)} dev dependencies from grimx.lock...")
 
+    # --- Runtime dependencies → root CMakeLists.txt ---
     vcpkg_deps = {k: v for k, v in deps.items() if v["manager"] == "vcpkg"}
     conan_deps = {k: v for k, v in deps.items() if v["manager"] == "conan"}
 
+    # --- Dev dependencies → tests/CMakeLists.txt ---
+    dev_vcpkg = {k: v for k, v in dev_deps.items() if v["manager"] == "vcpkg"}
+    dev_conan = {k: v for k, v in dev_deps.items() if v["manager"] == "conan"}
+
+    # Merge all vcpkg deps for a single install pass
+    all_vcpkg = {**vcpkg_deps, **dev_vcpkg}
+
     failed = []
 
-    if vcpkg_deps:
+    if all_vcpkg:
         if not _is_manager_available("vcpkg"):
             if not _prompt_and_install_manager("vcpkg"):
-                failed.extend(vcpkg_deps.keys())
-                vcpkg_deps = {}
+                failed.extend(all_vcpkg.keys())
+                all_vcpkg = {}
 
-        if vcpkg_deps:
-            ok, vcpkg_output = _restore_vcpkg(vcpkg_deps)
+        if all_vcpkg:
+            ok, vcpkg_output = _restore_vcpkg(all_vcpkg)
             if ok:
-                for name in vcpkg_deps:
+                for name in all_vcpkg:
                     click.echo(f"  ✓ {name}")
                 if vcpkg_output:
-                    patch_from_vcpkg_output(vcpkg_output, Path.cwd() / "CMakeLists.txt")
+                    # Route each package to correct CMakeLists
+                    patch_from_vcpkg_output(
+                        vcpkg_output,
+                        Path.cwd() / "CMakeLists.txt",
+                        exclude=set(dev_vcpkg.keys()),
+                    )
+                    if dev_vcpkg:
+                        tests_cmake = Path.cwd() / "tests" / "CMakeLists.txt"
+                        if tests_cmake.exists():
+                            patch_from_vcpkg_output(
+                                vcpkg_output,
+                                tests_cmake,
+                                include=set(dev_vcpkg.keys()),
+                            )
                 else:
-                    patch_all_from_lock(load_lock(), Path.cwd() / "CMakeLists.txt")
+                    patch_all_from_lock(lock, Path.cwd() / "CMakeLists.txt")
             else:
-                failed.extend(vcpkg_deps.keys())
+                failed.extend(all_vcpkg.keys())
 
-    for name, meta in conan_deps.items():
+    for name, meta in {**conan_deps, **dev_conan}.items():
+        is_dev = name in dev_conan
+        cmake_target = Path.cwd() / "tests" / "CMakeLists.txt" if is_dev else Path.cwd() / "CMakeLists.txt"
         if not _is_manager_available("conan"):
             if not _prompt_and_install_manager("conan"):
                 click.echo(f"  ✗ {name} — skipped (conan unavailable)", err=True)
@@ -223,9 +257,6 @@ def _restore_from_lock() -> None:
     if failed:
         click.echo(f"\n{len(failed)} package(s) failed: {', '.join(failed)}", err=True)
         raise SystemExit(1)
-
-    if conan_deps:
-        patch_all_from_lock(load_lock(), Path.cwd() / "CMakeLists.txt")
 
     click.echo(f"\n✓ all dependencies restored")
 
@@ -282,14 +313,19 @@ def _vcpkg_reconcile() -> tuple[bool, str]:
 
 
 def _sync_vcpkg_manifest() -> bool:
-    """Write vcpkg.json from current grimx.lock state."""
+    """Write vcpkg.json from current grimx.lock state — includes dev_dependencies."""
     lock = load_lock()
     deps = {
         k: v for k, v in lock.get("dependencies", {}).items()
         if v["manager"] == "vcpkg"
     }
+    dev_deps = {
+        k: v for k, v in lock.get("dev_dependencies", {}).items()
+        if v["manager"] == "vcpkg"
+    }
+    all_deps = {**deps, **dev_deps}
 
-    if not deps:
+    if not all_deps:
         return True
 
     baseline_result = subprocess.run(
@@ -310,7 +346,7 @@ def _sync_vcpkg_manifest() -> bool:
             {"name": name, "version>=": meta["version"]}
             if meta["version"] != "unknown"
             else name
-            for name, meta in deps.items()
+            for name, meta in all_deps.items()
         ],
     }
 
@@ -328,6 +364,11 @@ def _write_vcpkg_manifest_with(new_package: str) -> bool:
         k: v for k, v in lock.get("dependencies", {}).items()
         if v["manager"] == "vcpkg"
     }
+    existing_dev_deps = {
+        k: v for k, v in lock.get("dev_dependencies", {}).items()
+        if v["manager"] == "vcpkg"
+    }
+    all_existing = {**existing_deps, **existing_dev_deps}
 
     baseline_result = subprocess.run(
         ["git", "-C", str(Path.home() / ".vcpkg"), "rev-parse", "HEAD"],
@@ -343,7 +384,7 @@ def _write_vcpkg_manifest_with(new_package: str) -> bool:
         {"name": name, "version>=": meta["version"]}
         if meta["version"] != "unknown"
         else name
-        for name, meta in existing_deps.items()
+        for name, meta in all_existing.items()
     ]
 
     existing_names = {

@@ -87,8 +87,19 @@ def parse_vcpkg_output_hints(output: str) -> dict[str, UsageDirectives]:
     return results
 
 
-def patch_from_vcpkg_output(output: str, cmake_path: Path) -> None:
-    """Parse vcpkg install output and patch CMakeLists.txt for all packages."""
+def patch_from_vcpkg_output(
+    output: str,
+    cmake_path: Path,
+    include: set[str] | None = None,
+    exclude: set[str] | None = None,
+) -> None:
+    """
+    Parse vcpkg install output and patch CMakeLists.txt for all packages.
+    Called after every successful grimx install.
+
+    include: if set, only patch packages in this set
+    exclude: if set, skip packages in this set
+    """
     if not cmake_path.exists():
         return
 
@@ -102,6 +113,10 @@ def patch_from_vcpkg_output(output: str, cmake_path: Path) -> None:
     any_changed = False
 
     for package, directives in hints.items():
+        if include is not None and package not in include:
+            continue
+        if exclude is not None and package in exclude:
+            continue
         content, normalised, changed = _apply_directives(
             content, normalised, directives
         )

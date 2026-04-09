@@ -35,9 +35,10 @@ def new(name: str | None, project_type: str | None):
 
 @main.command("install")
 @click.argument("package", required=False, default=None)
-def install_cmd(package):
+@click.option("--dev", is_flag=True, default=False, help="Install as a dev/test dependency.")
+def install_cmd(package, dev):
     """Install a dependency, or restore all from grimx.lock."""
-    install_mod.run(package)
+    install_mod.run(package, dev=dev)
 
 
 @main.command("remove")

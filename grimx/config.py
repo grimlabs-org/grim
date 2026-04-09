@@ -47,8 +47,12 @@ def load_lock(root: Path | None = None) -> dict[str, Any]:
     if not path.exists():
         doc = tomlkit.document()
         doc["dependencies"] = tomlkit.table()
+        doc["dev_dependencies"] = tomlkit.table()
         return doc
-    return tomlkit.loads(path.read_text())
+    doc = tomlkit.loads(path.read_text())
+    if "dev_dependencies" not in doc:
+        doc["dev_dependencies"] = tomlkit.table()
+    return doc
 
 
 def write_lock(data: dict[str, Any], root: Path | None = None) -> None:
@@ -74,11 +78,37 @@ def add_dependency(
     lock["dependencies"][name] = entry
     write_lock(lock, root)
 
+
+def add_dev_dependency(
+    name: str,
+    manager: str,
+    version: str,
+    root: Path | None = None,
+) -> None:
+    lock = load_lock(root)
+
+    if "dev_dependencies" not in lock:
+        lock["dev_dependencies"] = tomlkit.table()
+
+    entry = tomlkit.inline_table()
+    entry.append("manager", manager)
+    entry.append("version", version)
+
+    lock["dev_dependencies"][name] = entry
+    write_lock(lock, root)
+
+
 def remove_dependency(name: str, root: Path | None = None) -> None:
-    """Remove a dependency entry from grimx.lock."""
     lock = load_lock(root)
     if "dependencies" in lock and name in lock["dependencies"]:
         del lock["dependencies"][name]
+    write_lock(lock, root)
+
+
+def remove_dev_dependency(name: str, root: Path | None = None) -> None:
+    lock = load_lock(root)
+    if "dev_dependencies" in lock and name in lock["dev_dependencies"]:
+        del lock["dev_dependencies"][name]
     write_lock(lock, root)
 
 # ---------------------------------------------------------------------------
