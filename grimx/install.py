@@ -40,9 +40,9 @@ def run(package: str | None, dev: bool = False) -> None:
         _restore_from_lock()
 
 
-def remove(package: str) -> None:
+def uninstall(package: str) -> None:
     """
-    Remove a package: update lock, regenerate vcpkg.json, reconcile
+    Uninstall/Remove a package : update lock, regenerate vcpkg.json, reconcile
     vcpkg_installed/, and reverse the CMakeLists.txt patch.
     """
     lock = load_lock()
@@ -69,10 +69,33 @@ def remove(package: str) -> None:
             if k != package and v.get("manager") == "vcpkg"
         }
 
+        install_root = Path.cwd() / "vcpkg_installed"
+        dry_run = subprocess.run(
+            [_vcpkg_bin(), "remove", package,
+             f"--x-install-root={install_root}",
+             "--recurse", "--classic", "--dry-run"],
+            capture_output=True, text=True,
+        )
+        collateral = [
+            line.strip().lstrip("* ").split(":")[0]
+            for line in dry_run.stdout.splitlines()
+            if line.strip().startswith("*")
+        ]
+        if collateral:
+            click.echo(f"  warning: uninstalling '{package}' will also remove: {', '.join(collateral)}")
+            click.confirm("  proceed?", abort=True)
+
+        subprocess.run([
+            _vcpkg_bin(),
+            "remove", package,
+            f"--x-install-root={install_root}",
+            "--recurse",
+            "--classic",
+        ])
+
         if remaining_vcpkg:
             _sync_vcpkg_manifest()
             click.echo("  ✓ vcpkg.json updated")
-            _vcpkg_reconcile()  # output not needed for remove
         else:
             vcpkg_json = Path.cwd() / "vcpkg.json"
             if vcpkg_json.exists():
@@ -80,7 +103,7 @@ def remove(package: str) -> None:
                 click.echo("  ✓ vcpkg.json removed (no remaining vcpkg dependencies)")
 
     unpatch_package(package, cmake_path, directives=pre_resolved)
-    click.echo(f"\n✓ '{package}' removed")
+    click.echo(f"\n✓ '{package}' uninstalled")
 
 
 def upgrade(package: str) -> None:
@@ -412,6 +435,10 @@ def _write_vcpkg_manifest_with(new_package: str) -> bool:
     (Path.cwd() / "vcpkg.json").write_text(json.dumps(manifest, indent=2))
     return True
 
+def _vcpkg_filename() -> str:
+    """Platform-correct vcpkg binary filename."""
+    return "vcpkg.exe" if platform.system() == "Windows" else "vcpkg"
+
 
 # ---------------------------------------------------------------------------
 # Manager availability
@@ -419,12 +446,12 @@ def _write_vcpkg_manifest_with(new_package: str) -> bool:
 
 def _is_manager_available(manager: str) -> bool:
     if manager == "vcpkg":
-        return bool(shutil.which("vcpkg")) or (Path.home() / ".vcpkg" / "vcpkg").exists()
+        return bool(shutil.which("vcpkg")) or (Path.home() / ".vcpkg" / _vcpkg_filename()).exists()
     return bool(shutil.which(manager))
 
 
 def _vcpkg_bin() -> str:
-    return shutil.which("vcpkg") or str(Path.home() / ".vcpkg" / "vcpkg")
+    return shutil.which("vcpkg") or str(Path.home() / ".vcpkg" / _vcpkg_filename())
 
 
 # ---------------------------------------------------------------------------
@@ -467,23 +494,36 @@ def _prompt_and_install_manager(manager: str) -> bool:
 
 def _auto_install_vcpkg() -> bool:
     vcpkg_dir = Path.home() / ".vcpkg"
+    vcpkg_binary = vcpkg_dir / _vcpkg_filename()
 
-    if vcpkg_dir.exists() and (vcpkg_dir / "vcpkg").exists():
+    if vcpkg_dir.exists() and vcpkg_binary.exists():
         click.echo("  vcpkg binary found, skipping clone and bootstrap.")
         os.environ["PATH"] = str(vcpkg_dir) + os.pathsep + os.environ.get("PATH", "")
         return True
 
-    if vcpkg_dir.exists() and not (vcpkg_dir / "vcpkg").exists():
+    if vcpkg_dir.exists() and not vcpkg_binary.exists():
         click.echo("  ~/.vcpkg exists but vcpkg binary is missing. Removing and re-cloning...")
         shutil.rmtree(vcpkg_dir)
 
+    # if not vcpkg_dir.exists():
+    #     click.echo("  Cloning vcpkg into ~/.vcpkg ...")
+    #     result = subprocess.run(
+    #         ["git", "clone", "https://github.com/microsoft/vcpkg.git", str(vcpkg_dir)],
+    #     )
+    #     if result.returncode != 0:
+    #         click.echo("  error: git clone failed.", err=True)
+    #         return False
+
     if not vcpkg_dir.exists():
-        click.echo("  Cloning vcpkg into ~/.vcpkg ...")
+        click.echo("  Cloning vcpkg into ~/.vcpkg (shallow)...")
         result = subprocess.run(
-            ["git", "clone", "https://github.com/microsoft/vcpkg.git", str(vcpkg_dir)],
+            ["git", "clone", "--depth", "1", "--filter=blob:none",
+             "https://github.com/microsoft/vcpkg.git", str(vcpkg_dir)],
         )
         if result.returncode != 0:
-            click.echo("  error: git clone failed.", err=True)
+            click.echo("   error: git clone failed.", err=True)
+            if vcpkg_dir.exists():
+                shutil.rmtree(vcpkg_dir, ignore_errors=True)
             return False
 
     click.echo("  Bootstrapping vcpkg...")
@@ -511,8 +551,14 @@ def _auto_install_vcpkg() -> bool:
     click.echo(f"  ✓ vcpkg installed at {vcpkg_dir}")
     return True
 
-
 def _persist_vcpkg_env(vcpkg_dir: Path) -> None:
+    if platform.system() == "Windows":
+        _persist_vcpkg_env_windows(vcpkg_dir)
+    else:
+        _persist_vcpkg_env_posix(vcpkg_dir)
+
+
+def _persist_vcpkg_env_posix(vcpkg_dir: Path) -> None:
     export_line = f'export PATH="{vcpkg_dir}:$PATH"'
     shell   = os.environ.get("SHELL", "")
     profile = Path.home() / (".zshrc" if "zsh" in shell else ".bashrc")
@@ -523,6 +569,23 @@ def _persist_vcpkg_env(vcpkg_dir: Path) -> None:
         f.write(f"\n# Added by grimx\n{export_line}\n")
     click.echo(f"  ✓ added to {profile} — run 'source {profile}' or open a new terminal")
 
+
+def _persist_vcpkg_env_windows(vcpkg_dir: Path) -> None:
+    click.echo("")
+    click.echo(f"  vcpkg installed at: {vcpkg_dir}")
+    click.echo("")
+    click.echo("  To make 'vcpkg' available in future PowerShell sessions, add it")
+    click.echo("  to your user PATH:")
+    click.echo("")
+    click.echo("    1. Press Win+R, type 'sysdm.cpl', press Enter")
+    click.echo("    2. Advanced tab → Environment Variables")
+    click.echo("    3. Under 'User variables', select Path → Edit → New")
+    click.echo(f"    4. Add: {vcpkg_dir}")
+    click.echo("")
+    click.echo("  Or run in an elevated PowerShell:")
+    click.echo(f"    [Environment]::SetEnvironmentVariable('Path', \"$env:Path;{vcpkg_dir}\", 'User')")
+    click.echo("")
+    click.echo("  grimx will use the binary directly for now via its absolute path.")
 
 def _auto_install_conan() -> bool:
     click.echo("  Installing conan via pip...")

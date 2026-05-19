@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import click
+import platform
 
 from grimx.config import load_lock
 
@@ -192,7 +193,7 @@ def _check_vcpkg() -> list[CheckResult]:
     results = []
 
     vcpkg_dir    = Path.home() / ".vcpkg"
-    vcpkg_bin    = vcpkg_dir / "vcpkg"
+    vcpkg_bin    = vcpkg_dir / ("vcpkg.exe" if platform.system() == "Windows" else "vcpkg")
     toolchain    = vcpkg_dir / "scripts" / "buildsystems" / "vcpkg.cmake"
 
     # Binary

@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import subprocess
 import shutil
+import platform
 from pathlib import Path
 
 import click
@@ -52,17 +53,22 @@ def run_app(args: list[str] | None = None) -> None:
         raise SystemExit(1)
 
     project_name = Path.cwd().name
-    binary = build_path / project_name
+    # binary = build_path / project_name
+    binary = _resolve_binary(build_path, project_name)
 
-    if not binary.exists():
-        candidates = [
-            p for p in build_path.iterdir()
-            if p.is_file() and _is_executable(p)
-        ]
-        if not candidates:
-            click.echo("error: no binary found in build/. Run 'grimx build' first.", err=True)
-            raise SystemExit(1)
-        binary = candidates[0]
+    if binary is None:
+        click.echo("error: no binary found in build/. Run 'grimx build' first.", err=True)
+        raise SystemExit(1)
+
+    # if not binary.exists():
+    #     candidates = [
+    #         p for p in build_path.iterdir()
+    #         if p.is_file() and _is_executable(p)
+    #     ]
+    #     if not candidates:
+    #         click.echo("error: no binary found in build/. Run 'grimx build' first.", err=True)
+    #         raise SystemExit(1)
+    #     binary = candidates[0]
 
     click.echo(f"Running {binary.name}...")
     result = subprocess.run([str(binary)] + (args or []))
@@ -194,3 +200,30 @@ def _require_tool(name: str) -> None:
 
 def _is_executable(path: Path) -> bool:
     return os.access(path, os.X_OK)
+
+def _resolve_binary(build_path: Path, project_name: str) -> Path | None:
+    """
+    Locate the project's executable in the build tree.
+
+    Handles single-config layouts (Ninja, Make) where binaries live directly
+    in build/, and multi-config layouts (Visual Studio) where binaries live
+    in build/<Config>/. Adds .exe suffix on Windows. Excludes CMake-internal
+    aggregate targets like ALL_BUILD and ZERO_CHECK.
+    """
+    is_windows = platform.system() == "Windows"
+    exe_suffix = ".exe" if is_windows else ""
+
+    # Single-config layout: build/<name>[.exe]
+    candidate = build_path / f"{project_name}{exe_suffix}"
+    if candidate.is_file():
+        return candidate
+
+    # Multi-config layout: build/<Config>/<name>[.exe]
+    # Prefer Debug since that's what we configure by default; fall back
+    # to anything else that built successfully.
+    for config in ("Debug", "Release", "RelWithDebInfo", "MinSizeRel"):
+        candidate = build_path / config / f"{project_name}{exe_suffix}"
+        if candidate.is_file():
+            return candidate
+
+    return None

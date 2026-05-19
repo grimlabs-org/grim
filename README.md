@@ -29,7 +29,7 @@ grimx upgrade fmt
 grimx clean
 grimx doctor
 grimx run
-grimx remove fmt
+grimx uninstall fmt
 ```
 
 ---
@@ -42,7 +42,7 @@ grimx remove fmt
 | `grimx new <name> --type c` | Scaffold a C project (default: cpp) |
 | `grimx install <pkg>` | Install a dependency |
 | `grimx install` | Restore all dependencies from lock file |
-| `grimx remove <pkg>` | Remove a dependency |
+| `grimx uninstall <pkg>` | Uninstall a dependency and remove its files |
 | `grimx upgrade <pkg>` | Upgrade a dependency to its latest version |
 | `grimx sync` | Sync CMakeLists.txt with source files in src/ and include/ |
 | `grimx build` | Build the project via CMake |

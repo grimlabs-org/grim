@@ -41,11 +41,11 @@ def install_cmd(package, dev):
     install_mod.run(package, dev=dev)
 
 
-@main.command("remove")
+@main.command("uninstall")
 @click.argument("package")
-def remove_cmd(package):
-    """Remove a dependency and reverse its CMakeLists.txt patch."""
-    install_mod.remove(package)
+def uninstall_cmd(package):
+    """Uninstall a dependency, remove its files, and reverse its CMakeLists.txt patch."""
+    install_mod.uninstall(package)
 
 
 @main.command("upgrade")
