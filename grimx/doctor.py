@@ -120,7 +120,7 @@ def _check_environment() -> list[CheckResult]:
             label="compiler",
             status="error",
             detail="no C++ compiler found (gcc or clang required)",
-            hint="sudo apt install build-essential",
+            hint="winget install Microsoft.VisualStudio.2022.BuildTools" if platform.system() == "Windows" else "sudo apt install build-essential",
         ))
 
     # make — required fallback if ninja absent
@@ -131,7 +131,7 @@ def _check_environment() -> list[CheckResult]:
             label="make",
             status="error",
             detail="not found",
-            hint="sudo apt install make",
+            hint="winget install GnuWin32.Make" if platform.system() == "Windows" else "sudo apt install make",
         ))
 
     # ninja — optional, recommended
@@ -143,7 +143,7 @@ def _check_environment() -> list[CheckResult]:
             label="ninja",
             status="warning",
             detail="not found (recommended for faster builds)",
-            hint="sudo apt install ninja-build",
+            hint="winget install Ninja-build.Ninja" if platform.system() == "Windows" else "sudo apt install ninja-build",
         ))
 
     # ccache — optional, recommended
@@ -155,7 +155,7 @@ def _check_environment() -> list[CheckResult]:
             label="ccache",
             status="warning",
             detail="not found (recommended for faster rebuilds)",
-            hint="sudo apt install ccache",
+            hint="winget install ccache" if platform.system() == "Windows" else "sudo apt install ccache",
         ))
 
     # mold — optional, recommended
@@ -167,7 +167,7 @@ def _check_environment() -> list[CheckResult]:
             label="mold",
             status="warning",
             detail="not found (recommended for faster linking)",
-            hint="sudo apt install mold",
+            hint=None if platform.system() == "Windows" else "sudo apt install mold",
         ))
 
     # git — required for vcpkg baseline
@@ -179,7 +179,7 @@ def _check_environment() -> list[CheckResult]:
             label="git",
             status="error",
             detail="not found",
-            hint="sudo apt install git",
+            hint="winget install Git.Git" if platform.system() == "Windows" else "sudo apt install git",
         ))
 
     return results
@@ -227,7 +227,7 @@ def _check_vcpkg() -> list[CheckResult]:
                 label="bootstrap",
                 status="error",
                 detail="vcpkg binary not executable",
-                hint=f"chmod +x {vcpkg_bin}",
+                hint=None if platform.system() == "Windows" else f"chmod +x {vcpkg_bin}",
             ))
 
     # Toolchain file
@@ -242,7 +242,7 @@ def _check_vcpkg() -> list[CheckResult]:
             label="toolchain",
             status="error",
             detail=f"{toolchain} not found",
-            hint="re-run vcpkg bootstrap: bash ~/.vcpkg/bootstrap-vcpkg.sh",
+            hint="~/.vcpkg/bootstrap-vcpkg.bat" if platform.system() == "Windows" else "bash ~/.vcpkg/bootstrap-vcpkg.sh",
         ))
 
     return results
